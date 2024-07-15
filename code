@@ -1,0 +1,178 @@
+import streamlit as st
+import imaplib
+import email
+import re
+from datetime import datetime, timedelta
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from twilio.rest import Client
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from apscheduler.schedulers.background import BackgroundScheduler
+import time
+import os
+
+# Initialize constants
+IMAP_SERVER = 'imap.gmail.com'
+SMTP_SERVER = 'smtp.gmail.com'
+SMTP_PORT = 465
+SCOPES = ['https://www.googleapis.com/auth/calendar']
+CALENDAR_ID = 'primary'
+TWILIO_PHONE_NUMBER = '+19382016372'
+TWILIO_ACCOUNT_SID = 'ACc010a842f762832d35af38681a88a697'
+TWILIO_AUTH_TOKEN = '4195abc5749ba4f5ae59d5af37c9c135'
+TOKEN_PATH = 'token.json'
+CLIENT_SECRETS_FILE = "path/to/client_secret.json"  # Update this path
+
+# Initialize Twilio client
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+creds = None
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+def get_google_calendar_service():
+    """Authenticate and return a Google Calendar API service instance."""
+    global creds
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_PATH, 'w') as token:
+            token.write(creds.to_json())
+    return build('calendar', 'v3', credentials=creds)
+
+def extract_event_details(msg):
+    """Extract event details from the email message."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition"))
+            if "attachment" not in content_disposition:
+                payload = part.get_payload(decode=True)
+                if payload is not None:
+                    payload = payload.decode()
+                    pattern = re.compile(r'Date: (\d{1,2}/\d{1,2}/\d{4})\s+Location: ([^\n]+)', re.DOTALL)
+                    match = pattern.search(payload)
+                    if match:
+                        event_date = datetime.strptime(match.group(1), "%d/%m/%Y").strftime("%Y-%m-%d")
+                        event_location = match.group(2)
+                        return event_date, event_location
+    return None, None
+
+def send_email(subject, content, sender_email, receiver_email, smtp_password):
+    """Send an email using SMTP."""
+    additional_message = """
+    To book the bus ticket for the event destination visit this site: https://www.redbus.in/
+    If you are planning to go by train, visit this site: https://www.irctc.co.in/nget/train-search
+    To reach anywhere, flights are the fastest way. So for flights, visit: https://www.makemytrip.com/
+    And if you are looking for hotels, you can always visit: https://www.makemytrip.com/
+    """
+    full_content = f"{content}\n\n{additional_message}"
+    
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = receiver_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(full_content, 'plain'))
+    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+        server.login(sender_email, smtp_password)
+        server.sendmail(sender_email, receiver_email, msg.as_string())
+
+def send_sms(message, receiver_phone_number):
+    """Send an SMS using Twilio."""
+    twilio_client.messages.create(
+        body=message,
+        from_=TWILIO_PHONE_NUMBER,
+        to=receiver_phone_number
+    )
+
+def add_event_to_google_calendar(event_summary, event_location, start_time, end_time):
+    """Add an event to Google Calendar."""
+    service = get_google_calendar_service()
+    event = {
+        'summary': event_summary,
+        'location': event_location,
+        'start': {
+            'dateTime': start_time,
+            'timeZone': 'Asia/Kolkata',
+        },
+        'end': {
+            'dateTime': end_time,
+            'timeZone': 'Asia/Kolkata',
+        },
+    }
+    event = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+    st.write('Event created: %s' % (event.get('htmlLink')))
+
+# def schedule_sms_reminder(event_date, event_location, receiver_phone_number):
+#     """Schedule SMS reminder to be sent 2 days before the event."""
+#     reminder_date = datetime.strptime(event_date, "%Y-%m-%d") - timedelta(days=2)
+#     reminder_time = reminder_date.strftime("%Y-%m-%d %H:%M:%S")
+
+#     def send_reminder_sms():
+#         send_sms(f"Reminder: Event on {event_date} in {event_location}", receiver_phone_number)
+#         st.success("Reminder SMS sent successfully!")
+
+#     scheduler.add_job(send_reminder_sms, 'date', run_date=reminder_time)
+
+# def schedule_sms_reminder(event_date, event_location, receiver_phone_number):
+#     """Schedule SMS reminder to be sent 2 days before the event."""
+#     reminder_date = datetime.strptime(event_date, "%Y-%m-%d") - timedelta(days=2)
+#     reminder_time = reminder_date.strftime("%Y-%m-%d %H:%M:%S")
+
+def main():
+    """Main function to run the Streamlit app."""
+    st.title('Email Reminder Web App')
+
+    # User input fields
+    email_address = st.text_input('Enter your Gmail address:')
+    app_password = st.text_input('Enter your Gmail app password:', type='password')
+
+    if st.button('Login'):
+        try:
+            # Connect to Gmail
+            mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+            mail.login(email_address, app_password)
+            st.success("Connected to Gmail successfully!")
+
+            mail.select('inbox')
+            status, messages = mail.search(None, '(ALL)')
+            mail_ids = messages[0].split()
+
+            for mail_id in mail_ids:
+                _, msg_data = mail.fetch(mail_id, '(RFC822)')
+                msg = email.message_from_bytes(msg_data[0][1])
+
+                event_date, event_location = extract_event_details(msg)
+
+                if event_date and event_location:
+                    # Send email immediately
+                    send_email("Event Notification", f"You have an event on {event_date} at {event_location}",
+                               email_address, email_address, app_password)
+                    st.success("Notification email sent successfully!")
+
+                    # Send SMS immediately
+                    send_sms(f"You have an event on {event_date} at {event_location}", "+918421540669")
+                    st.success("Notification SMS sent successfully!")
+
+                    # Add event to Google Calendar
+                    start_time = f"{event_date}T00:00:00"
+                    end_time = f"{event_date}T23:59:59"
+                    add_event_to_google_calendar("Event Reminder", event_location, start_time, end_time)
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
+        finally:
+            mail.logout()
+
+if __name__ == '__main__':
+    main()
+    while True:
+        time.sleep(2)
